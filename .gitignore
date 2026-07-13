@@ -1,0 +1,6 @@
+config.txt
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec

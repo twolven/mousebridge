@@ -1,0 +1,12 @@
+# MouseBridge agent configuration (copy to config.txt next to windows/agent.py)
+
+# Where to send HID packets:
+#  - wired path (recommended): the REMOTE PC's LAN IP, with relay.py running there
+#  - test path: the Pi's WiFi IP directly (no relay needed)
+PI_HOST = 192.168.1.101
+PI_PORT = 8800
+
+# Streaming window to watch (focus = stream on)
+WINDOW_TITLE = YourPCName - Moonlight
+# 'exact' or 'contains'
+TITLE_MATCH = exact

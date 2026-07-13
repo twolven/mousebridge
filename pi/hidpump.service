@@ -1,0 +1,12 @@
+[Unit]
+Description=MouseBridge HID report pump (UDP -> /dev/hidg0)
+After=mousebridge-gadget.service
+Requires=mousebridge-gadget.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/mousebridge/hidpump.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=MouseBridge composite USB gadget (HID mouse + NCM)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /opt/mousebridge/setup-gadget.sh
+
+[Install]
+WantedBy=multi-user.target
