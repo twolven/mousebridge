@@ -317,7 +317,7 @@ def win_event_proc(hook, event, hwnd, id_object, id_child, thread, ms_time):
 
 
 def main():
-    log("Starting MouseBridge agent v0.1...")
+    log("Starting MouseBridge agent v1.0...")
     # Single instance only - a second agent would double-send every packet
     kernel32.CreateMutexW(None, False, "Global\\MouseBridgeAgent")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS

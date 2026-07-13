@@ -1,165 +1,202 @@
 # MouseBridge
 
-Hardware USB HID mouse bridge for Moonlight/Sunshine setups. Replaces
-VirtualHere attach/detach switching (1–3 s per focus change) with **instant
-stream gating** (< 5 ms): a Raspberry Pi presents a *permanently enumerated,
-genuine USB mouse* to the remote PC, and the local PC simply starts/stops
-streaming HID reports to it when the streaming window gains/loses focus.
+**Instant, hardware-genuine mouse passthrough for Moonlight/Sunshine setups —
+no VirtualHere, no USB re-enumeration, no simulated input.**
+
+A Raspberry Pi presents a *permanently enumerated, real USB mouse* to your
+remote gaming PC. Your local PC captures your physical mouse with Raw Input
+and streams its movements to the Pi only while your streaming window is
+focused. Switching between local and remote is just "does the stream flow" —
+no device attach/detach, ever.
 
 Successor to [py-mousemove](https://github.com/twolven/py-mousemove) /
-[MouseMove-R](https://github.com/twolven/MouseMove-R). No VirtualHere, no USB
-re-enumeration, no simulated input — the remote PC sees real hardware on its
-USB bus.
+[MouseMove-R](https://github.com/twolven/MouseMove-R).
 
 ## Why
 
-The old MouseMove architecture physically re-plugged a USB device over the
-network on every focus change. The `USE` / `STOP USING` round-trip itself is
-fast, but the resulting USB enumeration on the remote host (driver bind, HID
-stack init) costs 1–3 seconds and cannot be optimized away.
+Some games (League of Legends and friends) reject the simulated input that
+Moonlight/Sunshine injects and demand a real USB HID device. VirtualHere
+solves that by forwarding your physical mouse over the network — but every
+focus switch physically re-plugs a USB device, and the resulting enumeration
+on the remote host costs 1–3 seconds. Games that enumerate input devices at
+launch also never see a mouse that wasn't attached before they started.
 
-MouseBridge inverts the design: the device is **always attached**. Switching
-is just "does the local agent forward packets right now or not."
+MouseBridge inverts the design: the (gadget) mouse is **always attached**.
 
-Always-attached also fixes a second VirtualHere pain: games that enumerate
-input devices at launch (League, etc.) ignored the mouse if it wasn't
-attached before the game started. The gadget mouse is enumerated from boot,
-so every launch sees it — no attach-before-launch ordering.
+**Measured, full path** (agent → LAN → relay → USB network → pump → HID write
+into the host's USB stack; 5,000 probes):
 
-| Stage                        | MouseMove (VirtualHere) | MouseBridge        |
-|------------------------------|-------------------------|--------------------|
-| Focus detection              | 0–250 ms (polling)      | ~0 ms (WinEvent hook) |
-| Command transport            | ~1–5 ms                 | ~0.5 ms (one UDP hop) |
-| Device availability          | 1–3 s (USB enumeration) | 0 ms (always attached) |
-| **Total switch time**        | **~1.5–3.5 s**          | **< 5 ms**         |
+| Metric | VirtualHere | MouseBridge |
+|---|---|---|
+| Focus switch time | 1.5–3.5 s | **< 5 ms** |
+| Round-trip latency p50 | — | **0.70 ms** |
+| Round-trip latency p99 | — (TCP stalls on loss) | **1.00 ms** (max 4.3 ms) |
+| Packet loss | n/a | **0 / 5,000** |
+| Game sees device at launch | only if attached first | **always** |
 
 ## Architecture
 
 ```
- LOCAL PC (Moonlight)                REMOTE PC (Sunshine host)         PI (gadget)
-┌─────────────────────┐            ┌──────────────────────────┐      ┌─────────────┐
-│ physical mouse      │            │                          │ USB  │ Pi Zero 2 W │
-│   │ Raw Input       │            │  usb0 (NCM) 10.66.0.1 ◄──┼──────┤ 10.66.0.2   │
-│   ▼                 │   LAN      │        ▲                 │cable │    │        │
-│ agent.py ───────────┼── UDP ────►│  relay.py (UDP fwd)      │      │ hidpump.py  │
-│   ▲ WinEvent hook   │  :8800     │                          │      │    ▼        │
-│ (focus = stream on) │            │  ◄═ HID mouse reports ═══╪══════╡ /dev/hidg0  │
-└─────────────────────┘            └──────────────────────────┘      └─────────────┘
+ LOCAL PC (Moonlight)              REMOTE PC (Sunshine host)          PI (gadget)
+┌────────────────────┐            ┌──────────────────────────┐      ┌─────────────┐
+│ physical mouse     │            │ tray icon + green/red    │ USB  │ Pi Zero 2 W │
+│   │ Raw Input      │            │ status overlay           │cable │             │
+│   ▼                │   LAN      │                          │      │             │
+│ agent ─────────────┼── UDP ────►│ relay ──► usb-NCM ───────┼──────┤ hidpump     │
+│  (streams only     │  :8800     │ 10.66.0.1     10.66.0.2 ◄┼─DHCP─┤  │          │
+│   while streaming  │            │                          │      │  ▼          │
+│   window focused)  │            │ ◄═ real HID mouse ═══════╪══════╡ /dev/hidg0  │
+└────────────────────┘            └──────────────────────────┘      └─────────────┘
 ```
 
-- **`windows/agent.py`** (local PC): captures the physical mouse via Raw
-  Input, watches foreground-window changes via `SetWinEventHook` (event-driven,
-  no polling), and streams 12-byte UDP packets only while the configured
-  window title is focused. On focus loss it sends a release packet (all
-  buttons up) and goes silent.
-- **`windows/relay.py`** (remote PC): UDP forwarder from the LAN interface to
-  the Pi's USB-ethernet address (the Pi hangs off the remote PC's USB port,
-  not the LAN). Also carries over MouseMoveR's kill hotkey: polls a key via
-  `GetAsyncKeyState` and force-kills a configured process — for hung
-  fullscreen games. No pip dependencies.
-- **`pi/setup-gadget.sh`** (Pi): configures a composite USB gadget via
-  configfs — one HID mouse function + one NCM ethernet function on the same
-  cable.
-- **`pi/hidpump.py`** (Pi): receives UDP packets and writes 7-byte HID
-  reports to `/dev/hidg0`. Failsafe: releases all buttons if the stream goes
-  silent for 300 ms.
+- **Agent** (local PC, `windows/agent.py`): Raw Input mouse capture,
+  event-driven focus detection (`SetWinEventHook`, zero polling). Streams
+  12-byte UDP packets only while the configured window title is foreground;
+  sends a release packet and goes silent on focus loss. Single-instance.
+- **Relay** (remote PC, `windows/relay.py`): windowless tray app. Forwards
+  agent packets from the LAN to the Pi over the USB-ethernet link, shows a
+  draggable always-on-top indicator — **green "ACTIVE"** when the stream is
+  flowing *and* the Pi answers health probes (echoed through the pump every
+  2 s), **red** with a reason otherwise. Right-click the tray icon to exit.
+  Optional hotkey that force-kills a hung game process.
+- **Pi** (`pi/`): composite USB gadget — one HID mouse (PixArt `093a:2510`
+  identity, 5 buttons, 16-bit deltas, wheel + horizontal wheel) plus one NCM
+  ethernet function **on the same cable**, so the Pi is wired through the
+  port it's plugged into (its 2.4 GHz WiFi is never on the input path).
+  `hidpump.py` turns UDP packets into HID reports with a 300 ms
+  release-all-buttons failsafe; dnsmasq hands the host PC its link address.
 
-## Transport: why not WiFi?
+### Why it can't desync
 
-The Pi Zero 2 W only has 2.4 GHz WiFi — fine for bulk traffic, bad for mouse
-input (interference bursts show up as 20–100 ms latency spikes, i.e. visible
-cursor stutter). The composite gadget sidesteps this entirely: the **NCM
-ethernet function rides the same USB cable as the mouse**, so the Pi is wired
-through the port it's already plugged into. End-to-end path is
-LAN + one USB hop, sub-millisecond and deterministic.
+Packets carry *relative* deltas like a real mouse — there is no absolute
+position to drift. Every packet (and a 100 ms keepalive) carries the **full
+button state**, so a lost button transition self-corrects on the next packet,
+and the pump releases everything after 300 ms of silence. A dropped packet
+costs a couple of pixels mid-swipe, not a stuck button or an offset cursor.
 
-WiFi still works as a fallback (point `PI_HOST` at the Pi's WLAN IP and skip
-the relay) — useful for initial testing before the relay is set up.
+## Hardware
 
-## Protocol
-
-UDP, 12 bytes, little-endian (`<HHBbhhbb`):
-
-| Field    | Type | Meaning                                    |
-|----------|------|--------------------------------------------|
-| magic    | u16  | `0x4D42` ("MB")                            |
-| seq      | u16  | wrapping sequence number (loss stats)      |
-| buttons  | u8   | bit0=L bit1=R bit2=M bit3=B4 bit4=B5       |
-| flags    | i8   | bit0 = keepalive (no motion, state only)   |
-| dx, dy   | i16  | relative motion                            |
-| wheel    | i8   | vertical wheel detents                     |
-| hwheel   | i8   | horizontal wheel (AC Pan) detents          |
-
-HID report (7 bytes): `buttons u8, dx i16, dy i16, wheel i8, hwheel i8`.
-LAN-only by design; no auth in v0.1 (see roadmap).
+- A USB-gadget-capable Pi: Zero / Zero 2 W / 4 / 5 (Zero 2 W is perfect).
+- One **data-capable** USB cable from the Pi's gadget port (Zero: the inner
+  micro-USB port; Pi 4/5: the USB-C power port) into the remote PC. The Pi
+  is powered by that same port — no other wiring.
+- Local and remote PC on the same LAN. Remote PC needs Windows 11 for the
+  inbox NCM driver (Windows 10: set `FUNC_NET="rndis"` in
+  `pi/setup-gadget.sh`).
 
 ## Setup
 
-### Pi (Zero 2 W or any gadget-capable Pi, plugged into remote PC USB)
+### 1. Pi
+
+Flash Raspberry Pi OS Lite, enable SSH/WiFi as usual, then:
 
 ```bash
-sudo mkdir -p /opt/mousebridge
-sudo cp pi/setup-gadget.sh pi/hidpump.py /opt/mousebridge/
-sudo cp pi/mousebridge-gadget.service pi/hidpump.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now mousebridge-gadget hidpump
+git clone https://github.com/twolven/mousebridge
+cd mousebridge
+sudo bash pi/install.sh     # adds dwc2 if missing, installs everything
+# reboot if the installer says so
 ```
 
-Requires `dtoverlay=dwc2` in `/boot/firmware/config.txt` and the data (inner)
-micro-USB port. The gadget presents as a PixArt OEM optical mouse
-(`093a:2510`) — a real commodity-hardware identity. Do **not** switch it to a
-vendor whose software runs on the host (e.g. Logitech IDs with G HUB, or any
-device VirtualHere is configured to capture): the vendor driver claims the
-device and the HID endpoint is never polled.
+Plug the Pi into the remote PC. Done — the PC sees a "USB Optical Mouse"
+plus a network adapter (it gets `10.66.0.1` via DHCP from the Pi).
 
-### Remote PC (Sunshine host)
+### 2. Remote PC (Sunshine host)
 
-The NCM interface appears automatically on Windows 11 (UsbNcm inbox driver);
-give it `10.66.0.1/24` if it doesn't DHCP. Then run the relay at logon
-(Task Scheduler):
+Grab `mousebridge-relay.exe` from
+[Releases](https://github.com/twolven/mousebridge/releases) (or build it:
+`pyinstaller --onefile --noconsole windows/relay.py`), put it in a folder
+next to `deploy/install-relay.cmd` and `deploy/start-relay.cmd`, and
+double-click `install-relay.cmd`. It installs to `%USERPROFILE%\MouseBridge`,
+opens UDP 8800 in the firewall, writes a default `config.txt`, adds a logon
+startup entry, and starts the relay (tray icon + status overlay).
 
-```
-python windows\relay.py --listen 0.0.0.0:8800 --forward 10.66.0.2:8800 ^
-    --kill-process "League of Legends.exe" --kill-key backslash
-```
+No Python needed — the exe is self-contained. (Running from source also
+works: `python relay.py`; agent and relay are stdlib-only.)
 
-(`--kill-*` is optional; run the task elevated if the target process is.
-Key names: backslash, pause, scrolllock, home/end/insert/delete, f1–f12,
-or a raw VK code like `0xDC`.)
+### 3. Local PC (Moonlight)
 
-(On Windows 10 set `FUNC_NET=rndis` in `setup-gadget.sh` instead of `ncm`.)
-
-### Local PC (Moonlight)
-
-Copy `config.example.txt` to `config.txt` next to `agent.py`, set:
+Grab `mousebridge-agent.exe` from Releases into `%USERPROFILE%\MouseBridge`
+along with `deploy/start-agent.cmd`, create `config.txt` next to it:
 
 ```ini
-PI_HOST = 192.168.1.xx     # remote PC LAN IP (relay), or Pi WiFi IP for testing
+PI_HOST = 192.168.1.x        # the REMOTE PC's LAN IP (the relay)
 PI_PORT = 8800
-WINDOW_TITLE = YourPC - Moonlight
-TITLE_MATCH = exact        # or 'contains'
+WINDOW_TITLE = YourPC - Moonlight   # exact title of the streaming window
+TITLE_MATCH = exact          # or 'contains'
+SCALE = 1.0                  # see DPI matching below
 ```
 
-Run `python windows\agent.py` (pythonw for no console).
+Run `start-agent.cmd` (and copy it into `shell:startup` for autostart). The
+console window shows live logs; closing it exits the agent.
 
-## Known considerations
+Focus your Moonlight window → the remote indicator flips green → your mouse
+is hardware-real on the remote PC. Alt-tab away → released.
 
-- **Double input**: unlike VirtualHere, the physical mouse never leaves the
-  local PC, so Moonlight still forwards its own (simulated) input to the host
-  alongside the bridge's hardware input. For apps that reject simulated input
-  (the whole point of this tool) that's harmless — only the bridge's input
-  lands. If an app accepts both, hide the physical mouse from Moonlight with
-  HidHide (whitelist `agent.py`'s python.exe).
-- **Wheel resolution**: v0.1 quantizes to 120-unit detents; hi-res scroll is
-  on the roadmap.
+## Config reference
 
-## Roadmap
+Agent (`%USERPROFILE%\MouseBridge\config.txt` on the local PC):
 
-- [ ] Optional HMAC packet auth
-- [ ] Hi-res wheel passthrough
-- [ ] Rust/C agent for guaranteed 1 kHz on low-end local PCs
-- [ ] Keyboard function on the same gadget
-- [ ] Tray icon + toggle hotkey
+| Key | Meaning |
+|---|---|
+| `PI_HOST` / `PI_PORT` | Where packets go — the remote PC's LAN IP (relay) |
+| `WINDOW_TITLE` | Streaming window to watch; focus = stream on |
+| `TITLE_MATCH` | `exact` or `contains` |
+| `SCALE` | Motion multiplier (fractional remainders carry over) |
+
+Relay (`%USERPROFILE%\MouseBridge\config.txt` on the remote PC):
+
+| Key | Meaning |
+|---|---|
+| `LISTEN` | LAN side, default `0.0.0.0:8800` |
+| `FORWARD` | Pi side, default `10.66.0.2:8800` |
+| `KILL_PROCESS` / `KILL_KEY` | Hotkey force-kill for hung games (blank = off) |
+| `STATUS_WINDOW` | `on`/`off` for the green/red overlay |
+
+### DPI matching (`SCALE`)
+
+Under VirtualHere your mouse ran its **onboard** DPI profile on the remote
+PC (no vendor software there). Under MouseBridge the sensor runs whatever
+your local vendor software sets, and deltas are replayed 1:1 — so the remote
+feel changes if those differ. Set `SCALE = old_dpi / current_dpi` (e.g.
+onboard 1200, LGHUB 3000 → `SCALE = 0.4`). Fractions accumulate, so slow
+precise aim is never lost.
+
+## Diagnostics
+
+- Every component logs 60-second stability stats: the agent to its console +
+  `mousebridge-agent.log`, the relay to `mousebridge-relay.log`, the pump to
+  `journalctl -u hidpump` (rx rate, sequence-gap loss, HID drops, worst
+  inter-packet gap).
+- `tools/latency_test.py --target <relay-ip>:8800 --count 5000 --with-write`
+  measures the real path end-to-end: probes ride the actual protocol, the
+  pump echoes after performing a genuine (null) HID write.
+- `tools/hidwrite_probe.py` (on the Pi) answers "is the host actually
+  polling the mouse?" with 100 paced writes — a single successful write only
+  proves the 1-slot queue was empty, so don't trust one.
+
+## Troubleshooting
+
+- **Status window red "PI DOWN"**: pump/gadget down or the USB network link
+  lost its address. `systemctl status mousebridge-gadget hidpump dnsmasq` on
+  the Pi; re-plugging the cable re-enumerates everything.
+- **Red "idle" while Moonlight is focused**: agent side — check the agent
+  console/log and that `WINDOW_TITLE` exactly matches (it's case-sensitive).
+- **Enumerated but no input** (`hidwrite_probe` says NOT polling): don't set
+  the gadget's VID/PID to a vendor whose software runs on the host —
+  e.g. Logitech IDs with G HUB installed: the vendor driver claims the
+  device, its vendor requests go unanswered, and the endpoint is never
+  polled. Stick with the PixArt identity or another vendor-software-free ID.
+- **Game sensitivity feels wrong**: `SCALE` (above).
+- **Windows 10 host**: NCM needs Win11; set `FUNC_NET="rndis"` in
+  `pi/setup-gadget.sh` and rerun `sudo bash pi/install.sh`.
+
+## Protocol
+
+UDP, 12 bytes little-endian (`<HHBbhhbb`): magic `0x4D42`, wrapping seq,
+button bitmap (L/R/M/B4/B5), flags (bit0 keepalive, bit1 echo), dx/dy i16,
+wheel/hwheel i8. HID report (7 bytes): buttons u8, dx i16, dy i16, wheel i8,
+hwheel i8. LAN-only by design; there is no authentication — don't expose
+port 8800 beyond your LAN.
 
 ## License
 

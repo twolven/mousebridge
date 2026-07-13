@@ -324,7 +324,7 @@ def main():
     status_win = (not args.no_status_window) and \
         cfg.get("STATUS_WINDOW", cfg.get("POPUPS", "on")).lower() != "off"
 
-    log("Starting MouseBridge relay v0.4...")
+    log("Starting MouseBridge relay v1.0...")
     # Single instance only (windowless build - no console to spot doubles)
     kernel32.CreateMutexW(None, False, "Global\\MouseBridgeRelay")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
