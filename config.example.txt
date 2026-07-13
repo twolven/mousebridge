@@ -15,4 +15,9 @@ TITLE_MATCH = exact
 # >1 = faster remote cursor, <1 = slower. Fractional remainders carry over,
 # so slow precise movements are never lost. (e.g. old DPI 1600 but sensor
 # now runs 800 -> SCALE = 2.0)
+# SCALE and CLICK_GRACE_MS hot-reload: edit + save while the agent runs.
 SCALE = 1.0
+
+# Suppress buttons for this long after focus gain, so the click that focused
+# the streaming window doesn't fire remotely (motion still flows)
+CLICK_GRACE_MS = 300

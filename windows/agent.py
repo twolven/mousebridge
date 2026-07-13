@@ -26,6 +26,8 @@ PI_PORT = 8800
 WINDOW_TITLE = "Moonlight"
 TITLE_MATCH = "exact"  # exact | contains
 SCALE = 1.0  # motion multiplier: >1 = faster remote cursor, <1 = slower
+CLICK_GRACE_MS = 300  # suppress buttons briefly after focus gain (the click
+                      # that focused the window must not fire remotely)
 
 
 BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
@@ -45,36 +47,79 @@ def log(message):
         pass
 
 
-def load_config(filename="config.txt"):
-    global PI_HOST, PI_PORT, WINDOW_TITLE, TITLE_MATCH, SCALE
-    path = os.path.join(BASE_DIR, filename)
-    if not os.path.exists(path):
-        log(f"No config at '{path}', using defaults.")
-        return
-    with open(path, "r", encoding="utf-8") as f:
+CONFIG_PATH = os.path.join(BASE_DIR, "config.txt")
+_config_mtime = 0.0
+
+
+def _parse_config():
+    values = {}
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip()
-            try:
-                if key == "PI_HOST":
-                    PI_HOST = value
-                elif key == "PI_PORT":
-                    PI_PORT = int(value)
-                elif key == "WINDOW_TITLE":
-                    WINDOW_TITLE = value
-                elif key == "TITLE_MATCH":
-                    TITLE_MATCH = value.lower()
-                elif key == "SCALE":
-                    SCALE = float(value)
-                else:
-                    log(f"Warning: unknown key '{key}' on line {line_num}")
-            except ValueError:
-                log(f"Warning: bad value for '{key}' on line {line_num}: '{value}'")
+            values[key.strip().upper()] = (value.strip(), line_num)
+    return values
+
+
+def load_config():
+    global PI_HOST, PI_PORT, WINDOW_TITLE, TITLE_MATCH, SCALE, CLICK_GRACE_MS, \
+        _config_mtime
+    if not os.path.exists(CONFIG_PATH):
+        log(f"No config at '{CONFIG_PATH}', using defaults.")
+        return
+    _config_mtime = os.path.getmtime(CONFIG_PATH)
+    for key, (value, line_num) in _parse_config().items():
+        try:
+            if key == "PI_HOST":
+                PI_HOST = value
+            elif key == "PI_PORT":
+                PI_PORT = int(value)
+            elif key == "WINDOW_TITLE":
+                WINDOW_TITLE = value
+            elif key == "TITLE_MATCH":
+                TITLE_MATCH = value.lower()
+            elif key == "SCALE":
+                SCALE = float(value)
+            elif key == "CLICK_GRACE_MS":
+                CLICK_GRACE_MS = int(value)
+            else:
+                log(f"Warning: unknown key '{key}' on line {line_num}")
+        except ValueError:
+            log(f"Warning: bad value for '{key}' on line {line_num}: '{value}'")
     log(f"Config: target={PI_HOST}:{PI_PORT} title='{WINDOW_TITLE}' "
-        f"({TITLE_MATCH}) scale={SCALE}")
+        f"({TITLE_MATCH}) scale={SCALE} click_grace={CLICK_GRACE_MS}ms")
+
+
+def maybe_reload_config():
+    """Hot-reload live-tunable keys (SCALE, CLICK_GRACE_MS) when config.txt
+    changes on disk - lets sensitivity be dialed in without a restart."""
+    global SCALE, CLICK_GRACE_MS, _config_mtime
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return
+    if mtime == _config_mtime:
+        return
+    _config_mtime = mtime
+    try:
+        values = _parse_config()
+    except OSError:
+        return
+    for key, cast, name in ((("SCALE"), float, "SCALE"),
+                            (("CLICK_GRACE_MS"), int, "CLICK_GRACE_MS")):
+        if key in values:
+            try:
+                new = cast(values[key][0])
+            except ValueError:
+                continue
+            if name == "SCALE" and new != SCALE:
+                SCALE = new
+                log(f"[Config] SCALE hot-reloaded: {SCALE}")
+            elif name == "CLICK_GRACE_MS" and new != CLICK_GRACE_MS:
+                CLICK_GRACE_MS = new
+                log(f"[Config] CLICK_GRACE_MS hot-reloaded: {CLICK_GRACE_MS}")
 
 
 # --- Win32 setup ---
@@ -189,6 +234,9 @@ class Bridge:
         # Fractional motion carry so SCALE never loses slow precise movement
         self.acc_x = 0.0
         self.acc_y = 0.0
+        # Buttons masked until this deadline after focus gain, so the click
+        # that focused the streaming window never fires remotely
+        self.click_grace_until = 0.0
 
     def scale_motion(self, dx, dy):
         if SCALE == 1.0:
@@ -201,7 +249,10 @@ class Bridge:
         return out_x, out_y
 
     def send(self, dx=0, dy=0, wheel=0, hwheel=0, flags=0):
-        pkt = struct.pack(PACKET_FMT, MAGIC, self.seq, self.buttons, flags,
+        buttons = self.buttons
+        if buttons and time.monotonic() < self.click_grace_until:
+            buttons = 0  # focus-gaining click: motion passes, buttons don't
+        pkt = struct.pack(PACKET_FMT, MAGIC, self.seq, buttons, flags,
                           dx, dy, wheel, hwheel)
         self.seq = (self.seq + 1) & 0xFFFF
         self.sent += 1
@@ -213,6 +264,7 @@ class Bridge:
 
     def maybe_log_stats(self):
         """Called from the keepalive timer; 60s stability line while streaming."""
+        maybe_reload_config()
         now = time.monotonic()
         if self.streaming and now >= self.next_stats:
             mins = (now - self.session_start) / 60.0
@@ -227,6 +279,7 @@ class Bridge:
         if on:
             self.session_start = time.monotonic()
             self.next_stats = self.session_start + self.STATS_INTERVAL
+            self.click_grace_until = self.session_start + CLICK_GRACE_MS / 1000.0
             log(f"Focus GAINED -> streaming to {self.target[0]}:{self.target[1]}")
         else:
             # Release everything on the remote side before going silent
