@@ -1,0 +1,5 @@
+# Pi-side files must stay LF even in Windows checkouts (CRLF breaks bash/systemd)
+*.sh text eol=lf
+*.service text eol=lf
+pi/** text eol=lf
+*.py text eol=lf
