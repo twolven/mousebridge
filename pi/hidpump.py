@@ -110,7 +110,9 @@ def main():
 
         received += 1
         win_rx += 1
-        if last_seq is not None:
+        # Seq gaps only count within a live stream; after >1s of silence the
+        # agent may have restarted (seq reset), which is not packet loss
+        if last_seq is not None and last_rx_t is not None and (now - last_rx_t) <= 1.0:
             gap = (seq - last_seq - 1) & 0xFFFF
             if 0 < gap < 1000:
                 lost += gap
@@ -126,14 +128,26 @@ def main():
         needs_write = not ((flags & FLAG_KEEPALIVE) and buttons == last_buttons
                            and not (dx or dy or wheel or hwheel))
         if needs_write:
+            report = struct.pack(REPORT_FMT, buttons, dx, dy, wheel, hwheel)
             try:
-                os.write(hid, struct.pack(REPORT_FMT, buttons, dx, dy, wheel, hwheel))
+                os.write(hid, report)
                 last_buttons = buttons
             except OSError as e:
                 if e.errno == errno.EAGAIN:
-                    # Host not draining the endpoint (suspend/driver) - drop,
-                    # never block; the counter surfaces it in [Stats]
-                    win_dropped += 1
+                    # Endpoint busy: the 1-slot queue still holds the previous
+                    # report (1kHz packets can outpace the host poll). Wait
+                    # briefly for writability instead of dropping - a dropped
+                    # button transition only self-heals on the next keepalive
+                    # ~100ms later, which breaks double-clicks.
+                    _, writable, _ = select.select([], [hid], [], 0.008)
+                    try:
+                        if writable:
+                            os.write(hid, report)
+                            last_buttons = buttons
+                        else:
+                            win_dropped += 1  # host genuinely not polling
+                    except OSError:
+                        win_dropped += 1
                 else:
                     log(f"HID write error: {e}")
                     time.sleep(0.5)
