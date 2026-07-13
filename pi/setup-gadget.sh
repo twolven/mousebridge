@@ -13,13 +13,17 @@ set -e
 
 G=/sys/kernel/config/usb_gadget/mousebridge
 
-# Generic defaults. If the target app fingerprints hardware, set these to a
-# real mouse's IDs (lsusb on any PC with the real mouse attached).
-ID_VENDOR="0x1d6b"
-ID_PRODUCT="0x0104"
-MANUFACTURER="MouseBridge"
+# Device identity: PixArt OEM optical mouse - a real commodity-hardware ID.
+# WARNING: do NOT use a vendor ID whose software is installed on the host
+# (e.g. Logitech 046d with G HUB present): the vendor driver claims the
+# device, its vendor requests go unanswered, and the HID endpoint is never
+# polled - every report drops. Confirmed with G502 IDs against LGHUB.
+ID_VENDOR="0x093a"
+ID_PRODUCT="0x2510"
+BCD_DEVICE="0x0100"
+MANUFACTURER="PixArt"
 PRODUCT="USB Optical Mouse"
-SERIAL="MB000001"
+SERIAL=""
 
 # Network function: ncm (Windows 11 inbox driver), rndis (Windows 10),
 # or ecm (Linux/mac hosts).
@@ -41,13 +45,13 @@ cd "$G"
 
 echo "$ID_VENDOR"  > idVendor
 echo "$ID_PRODUCT" > idProduct
-echo 0x0100 > bcdDevice
+echo "$BCD_DEVICE" > bcdDevice
 echo 0x0200 > bcdUSB
 
 mkdir -p strings/0x409
-echo "$SERIAL"       > strings/0x409/serialnumber
 echo "$MANUFACTURER" > strings/0x409/manufacturer
 echo "$PRODUCT"      > strings/0x409/product
+[ -n "$SERIAL" ] && echo "$SERIAL" > strings/0x409/serialnumber
 
 # --- HID mouse function ---
 mkdir -p functions/hid.usb0

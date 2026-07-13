@@ -18,12 +18,18 @@
 
 import argparse
 import ctypes
+import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 
 user32 = ctypes.windll.user32
+
+BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                           else os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "mousebridge-relay.log")
 
 VK_NAMES = {
     "backslash": 0xDC,   # VK_OEM_5
@@ -38,7 +44,15 @@ VK_NAMES = {
 
 
 def log(message):
-    print(f"[{time.strftime('%H:%M:%S')}] [Relay] {message}", flush=True)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [Relay] {message}"
+    print(line, flush=True)
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
+            os.replace(LOG_FILE, LOG_FILE + ".old")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def kill_process(name):
@@ -91,19 +105,48 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((lhost, int(lport)))
+    sock.settimeout(1.0)  # so stats flush even when idle
     log(f"Relaying {args.listen} -> {args.forward}")
 
-    count = 0
+    # Rolling 60s stability stats
+    STATS_INTERVAL = 60.0
+    total = 0
+    win_fwd = 0
+    win_back = 0
+    client = None  # last agent address, for routing Pi replies (echo/latency tests)
+    next_stats = time.monotonic() + STATS_INTERVAL
+
     while True:
+        now = time.monotonic()
+        if now >= next_stats:
+            if win_fwd or win_back:
+                log(f"[Stats] 60s: {win_fwd} agent->pi ({win_fwd / STATS_INTERVAL:.0f}/s), "
+                    f"{win_back} pi->agent, client={client[0] if client else 'none'} "
+                    f"(lifetime {total})")
+            win_fwd = win_back = 0
+            next_stats = now + STATS_INTERVAL
+
         try:
-            data, _ = sock.recvfrom(64)
-            sock.sendto(data, dst)
-            count += 1
-            if count % 100000 == 0:
-                log(f"{count} packets relayed")
+            data, src = sock.recvfrom(64)
+        except socket.timeout:
+            continue
         except OSError as e:
             log(f"Socket error: {e}; continuing")
             time.sleep(0.1)
+            continue
+
+        try:
+            if src[0] == dst[0]:
+                if client:
+                    sock.sendto(data, client)
+                    win_back += 1
+            else:
+                client = src
+                sock.sendto(data, dst)
+                win_fwd += 1
+            total += 1
+        except OSError as e:
+            log(f"Forward error: {e}")
 
 
 if __name__ == "__main__":

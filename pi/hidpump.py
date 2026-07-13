@@ -7,6 +7,8 @@
 # (agent crash, link drop), releases all buttons after FAILSAFE_S.
 ###############################################################################
 
+import errno
+import os
 import select
 import signal
 import socket
@@ -19,6 +21,8 @@ PACKET_FMT = "<HHBbhhbb"
 PACKET_SIZE = struct.calcsize(PACKET_FMT)
 REPORT_FMT = "<Bhhbb"  # buttons, dx, dy, wheel, hwheel
 FLAG_KEEPALIVE = 0x01
+
+FLAG_ECHO = 0x02  # reply to sender after processing (latency measurement)
 
 LISTEN_PORT = 8800
 HID_DEV = "/dev/hidg0"
@@ -45,7 +49,9 @@ def main():
     sock.setblocking(False)
 
     try:
-        hid = open(HID_DEV, "wb", buffering=0)
+        # Non-blocking: if the host stops polling the interrupt endpoint
+        # (suspend, driver issue), writes EAGAIN instead of wedging the pump
+        hid = os.open(HID_DEV, os.O_RDWR | os.O_NONBLOCK)
     except OSError as e:
         log(f"FATAL: cannot open {HID_DEV}: {e} (gadget not configured?)")
         sys.exit(1)
@@ -56,18 +62,44 @@ def main():
     lost = 0
     received = 0
 
+    # Rolling 60s stability stats: rx rate, seq-gap loss, worst inter-packet
+    # gap while a stream is active (gaps >500ms = focus pause, not jitter)
+    STATS_INTERVAL = 60.0
+    win_rx = 0
+    win_lost = 0
+    win_dropped = 0  # reports the host would not accept (EAGAIN)
+    win_max_gap = 0.0
+    last_rx_t = None
+    next_stats = time.monotonic() + STATS_INTERVAL
+
     while running:
         ready, _, _ = select.select([sock], [], [], FAILSAFE_S)
+
+        now = time.monotonic()
+        if now >= next_stats:
+            if win_rx:
+                total = win_rx + win_lost
+                log(f"[Stats] 60s: rx {win_rx} ({win_rx / STATS_INTERVAL:.0f}/s), "
+                    f"lost {win_lost} ({100.0 * win_lost / total:.3f}%), "
+                    f"hid drops {win_dropped}, "
+                    f"max stream gap {win_max_gap * 1000.0:.0f}ms "
+                    f"(lifetime rx {received}, lost {lost})")
+            win_rx = win_lost = win_dropped = 0
+            win_max_gap = 0.0
+            next_stats = now + STATS_INTERVAL
 
         if not ready:
             if last_buttons:
                 log(f"Failsafe: stream silent {FAILSAFE_S}s with buttons held -> releasing")
-                hid.write(struct.pack(REPORT_FMT, 0, 0, 0, 0, 0))
+                try:
+                    os.write(hid, struct.pack(REPORT_FMT, 0, 0, 0, 0, 0))
+                except OSError:
+                    pass
                 last_buttons = 0
             continue
 
         try:
-            data, _ = sock.recvfrom(64)
+            data, sender = sock.recvfrom(64)
         except OSError:
             continue
         if len(data) != PACKET_SIZE:
@@ -77,30 +109,46 @@ def main():
             continue
 
         received += 1
+        win_rx += 1
         if last_seq is not None:
             gap = (seq - last_seq - 1) & 0xFFFF
             if 0 < gap < 1000:
                 lost += gap
+                win_lost += gap
         last_seq = seq
-        if received % 100000 == 0:
-            log(f"{received} packets, {lost} lost")
+        if last_rx_t is not None:
+            delta = now - last_rx_t
+            if delta <= 0.5 and delta > win_max_gap:
+                win_max_gap = delta
+        last_rx_t = now
 
         # Keepalives only need a report if button state changed
-        if (flags & FLAG_KEEPALIVE) and buttons == last_buttons and not (dx or dy or wheel or hwheel):
-            continue
+        needs_write = not ((flags & FLAG_KEEPALIVE) and buttons == last_buttons
+                           and not (dx or dy or wheel or hwheel))
+        if needs_write:
+            try:
+                os.write(hid, struct.pack(REPORT_FMT, buttons, dx, dy, wheel, hwheel))
+                last_buttons = buttons
+            except OSError as e:
+                if e.errno == errno.EAGAIN:
+                    # Host not draining the endpoint (suspend/driver) - drop,
+                    # never block; the counter surfaces it in [Stats]
+                    win_dropped += 1
+                else:
+                    log(f"HID write error: {e}")
+                    time.sleep(0.5)
 
-        try:
-            hid.write(struct.pack(REPORT_FMT, buttons, dx, dy, wheel, hwheel))
-            last_buttons = buttons
-        except OSError as e:
-            # Host asleep / not enumerated: hidg write blocks or errors. Drop and continue.
-            log(f"HID write error: {e} (host asleep?)")
-            time.sleep(0.5)
+        # Echo after processing so a round-trip measures the full program path
+        if flags & FLAG_ECHO:
+            try:
+                sock.sendto(data, sender)
+            except OSError:
+                pass
 
     log("Shutting down; releasing buttons.")
     try:
-        hid.write(struct.pack(REPORT_FMT, 0, 0, 0, 0, 0))
-        hid.close()
+        os.write(hid, struct.pack(REPORT_FMT, 0, 0, 0, 0, 0))
+        os.close(hid)
     except OSError:
         pass
 

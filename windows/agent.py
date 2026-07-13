@@ -27,15 +27,26 @@ WINDOW_TITLE = "Moonlight"
 TITLE_MATCH = "exact"  # exact | contains
 
 
+BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                           else os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "mousebridge-agent.log")
+
+
 def log(message):
-    print(f"[{time.strftime('%H:%M:%S')}] [Agent] {message}", flush=True)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [Agent] {message}"
+    print(line, flush=True)
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
+            os.replace(LOG_FILE, LOG_FILE + ".old")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def load_config(filename="config.txt"):
     global PI_HOST, PI_PORT, WINDOW_TITLE, TITLE_MATCH
-    base_dir = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
-                               else os.path.abspath(__file__))
-    path = os.path.join(base_dir, filename)
+    path = os.path.join(BASE_DIR, filename)
     if not os.path.exists(path):
         log(f"No config at '{path}', using defaults.")
         return
@@ -65,6 +76,19 @@ def load_config(filename="config.txt"):
 # --- Win32 setup ---
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+
+# 64-bit correctness: default ctypes restype is a 32-bit int, which truncates
+# handles/LRESULTs and mangles HWND_MESSAGE (-3)
+user32.CreateWindowExW.restype = wt.HWND
+user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, wt.HWND, wt.HMENU,
+                                   wt.HINSTANCE, wt.LPVOID]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.SetWinEventHook.restype = wt.HANDLE
+user32.DefWindowProcW.restype = ctypes.c_longlong
+user32.DefWindowProcW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+kernel32.GetModuleHandleW.restype = wt.HMODULE
 
 WM_INPUT = 0x00FF
 WM_TIMER = 0x0113
@@ -146,6 +170,8 @@ class WNDCLASSW(ctypes.Structure):
 
 # --- Bridge state ---
 class Bridge:
+    STATS_INTERVAL = 60.0
+
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.target = (PI_HOST, PI_PORT)
@@ -153,6 +179,9 @@ class Bridge:
         self.buttons = 0
         self.seq = 0
         self.sent = 0
+        self.send_errors = 0
+        self.session_start = 0.0
+        self.next_stats = 0.0
 
     def send(self, dx=0, dy=0, wheel=0, hwheel=0, flags=0):
         pkt = struct.pack(PACKET_FMT, MAGIC, self.seq, self.buttons, flags,
@@ -162,20 +191,35 @@ class Bridge:
         try:
             self.sock.sendto(pkt, self.target)
         except OSError as e:
-            log(f"UDP send error: {e}")
+            self.send_errors += 1
+            log(f"UDP send error #{self.send_errors}: {e}")
+
+    def maybe_log_stats(self):
+        """Called from the keepalive timer; 60s stability line while streaming."""
+        now = time.monotonic()
+        if self.streaming and now >= self.next_stats:
+            mins = (now - self.session_start) / 60.0
+            log(f"[Stats] streaming {mins:.0f}min: {self.sent} pkts sent, "
+                f"{self.send_errors} send errors")
+            self.next_stats = now + self.STATS_INTERVAL
 
     def set_streaming(self, on):
         if on == self.streaming:
             return
         self.streaming = on
         if on:
+            self.session_start = time.monotonic()
+            self.next_stats = self.session_start + self.STATS_INTERVAL
             log(f"Focus GAINED -> streaming to {self.target[0]}:{self.target[1]}")
         else:
             # Release everything on the remote side before going silent
             self.buttons = 0
             self.send(flags=FLAG_KEEPALIVE)
-            log(f"Focus LOST -> stream stopped ({self.sent} packets this session)")
+            mins = (time.monotonic() - self.session_start) / 60.0
+            log(f"Focus LOST -> stream stopped ({self.sent} packets, "
+                f"{self.send_errors} send errors, {mins:.1f}min session)")
             self.sent = 0
+            self.send_errors = 0
 
 
 bridge = Bridge()
@@ -240,6 +284,7 @@ def wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_TIMER:
         if bridge.streaming:
             bridge.send(flags=FLAG_KEEPALIVE)  # keeps held buttons alive on the pump
+            bridge.maybe_log_stats()
         return 0
     if msg == WM_DESTROY:
         user32.PostQuitMessage(0)
@@ -255,6 +300,11 @@ def win_event_proc(hook, event, hwnd, id_object, id_child, thread, ms_time):
 
 def main():
     log("Starting MouseBridge agent v0.1...")
+    # Single instance only - a second agent would double-send every packet
+    kernel32.CreateMutexW(None, False, "Global\\MouseBridgeAgent")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        log("Another agent instance is already running. Exiting.")
+        sys.exit(0)
     load_config()
     bridge.target = (PI_HOST, PI_PORT)
 
@@ -268,7 +318,8 @@ def main():
         sys.exit(1)
 
     hwnd = user32.CreateWindowExW(0, wc.lpszClassName, "MouseBridge", 0,
-                                  0, 0, 0, 0, HWND_MESSAGE, None, hinstance, None)
+                                  0, 0, 0, 0, wt.HWND(HWND_MESSAGE), None,
+                                  hinstance, None)
     if not hwnd:
         log(f"CreateWindowExW failed: {kernel32.GetLastError()}")
         sys.exit(1)

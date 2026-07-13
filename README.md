@@ -106,9 +106,11 @@ sudo systemctl enable --now mousebridge-gadget hidpump
 ```
 
 Requires `dtoverlay=dwc2` in `/boot/firmware/config.txt` and the data (inner)
-micro-USB port. The gadget defaults to a generic VID/PID; if the target app
-fingerprints devices, set `ID_VENDOR`/`ID_PRODUCT` in `setup-gadget.sh` to
-match a real mouse.
+micro-USB port. The gadget presents as a PixArt OEM optical mouse
+(`093a:2510`) — a real commodity-hardware identity. Do **not** switch it to a
+vendor whose software runs on the host (e.g. Logitech IDs with G HUB, or any
+device VirtualHere is configured to capture): the vendor driver claims the
+device and the HID endpoint is never polled.
 
 ### Remote PC (Sunshine host)
 
