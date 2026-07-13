@@ -141,7 +141,8 @@ Agent (`%USERPROFILE%\MouseBridge\config.txt` on the local PC):
 | `PI_HOST` / `PI_PORT` | Where packets go — the remote PC's LAN IP (relay) |
 | `WINDOW_TITLE` | Streaming window to watch; focus = stream on |
 | `TITLE_MATCH` | `exact` or `contains` |
-| `SCALE` | Motion multiplier (fractional remainders carry over) |
+| `SCALE` | Motion multiplier (fractional remainders carry over); **hot-reloads on save** |
+| `CLICK_GRACE_MS` | Buttons masked this long after focus gain so the click that focused the window doesn't fire remotely (default 300); hot-reloads |
 
 Relay (`%USERPROFILE%\MouseBridge\config.txt` on the remote PC):
 
@@ -159,7 +160,14 @@ PC (no vendor software there). Under MouseBridge the sensor runs whatever
 your local vendor software sets, and deltas are replayed 1:1 — so the remote
 feel changes if those differ. Set `SCALE = old_dpi / current_dpi` (e.g.
 onboard 1200, LGHUB 3000 → `SCALE = 0.4`). Fractions accumulate, so slow
-precise aim is never lost.
+precise aim is never lost. `SCALE` hot-reloads when you save `config.txt`,
+so you can tune it live mid-stream. Hardware DPI-shift buttons keep working
+naturally — their count changes flow through the bridge proportionally.
+
+If you also stream the desktop (not just input-picky games), disable mouse
+handling in Sunshine (`mouse = disabled` in `sunshine.conf`) so the bridge
+is the only click source — otherwise Sunshine's simulated clicks interleave
+with the bridge's hardware clicks and break double-clicks.
 
 ## Diagnostics
 
