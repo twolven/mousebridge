@@ -21,6 +21,11 @@ stack init) costs 1–3 seconds and cannot be optimized away.
 MouseBridge inverts the design: the device is **always attached**. Switching
 is just "does the local agent forward packets right now or not."
 
+Always-attached also fixes a second VirtualHere pain: games that enumerate
+input devices at launch (League, etc.) ignored the mouse if it wasn't
+attached before the game started. The gadget mouse is enumerated from boot,
+so every launch sees it — no attach-before-launch ordering.
+
 | Stage                        | MouseMove (VirtualHere) | MouseBridge        |
 |------------------------------|-------------------------|--------------------|
 | Focus detection              | 0–250 ms (polling)      | ~0 ms (WinEvent hook) |
@@ -47,9 +52,11 @@ is just "does the local agent forward packets right now or not."
   no polling), and streams 12-byte UDP packets only while the configured
   window title is focused. On focus loss it sends a release packet (all
   buttons up) and goes silent.
-- **`windows/relay.py`** (remote PC): 30-line UDP forwarder from the LAN
-  interface to the Pi's USB-ethernet address. Needed because the Pi hangs off
-  the remote PC's USB port, not the LAN.
+- **`windows/relay.py`** (remote PC): UDP forwarder from the LAN interface to
+  the Pi's USB-ethernet address (the Pi hangs off the remote PC's USB port,
+  not the LAN). Also carries over MouseMoveR's kill hotkey: polls a key via
+  `GetAsyncKeyState` and force-kills a configured process — for hung
+  fullscreen games. No pip dependencies.
 - **`pi/setup-gadget.sh`** (Pi): configures a composite USB gadget via
   configfs — one HID mouse function + one NCM ethernet function on the same
   cable.
@@ -110,8 +117,13 @@ give it `10.66.0.1/24` if it doesn't DHCP. Then run the relay at logon
 (Task Scheduler):
 
 ```
-python windows\relay.py --listen 0.0.0.0:8800 --forward 10.66.0.2:8800
+python windows\relay.py --listen 0.0.0.0:8800 --forward 10.66.0.2:8800 ^
+    --kill-process "League of Legends.exe" --kill-key backslash
 ```
+
+(`--kill-*` is optional; run the task elevated if the target process is.
+Key names: backslash, pause, scrolllock, home/end/insert/delete, f1–f12,
+or a raw VK code like `0xDC`.)
 
 (On Windows 10 set `FUNC_NET=rndis` in `setup-gadget.sh` instead of `ncm`.)
 
