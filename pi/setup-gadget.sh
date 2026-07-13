@@ -59,18 +59,30 @@ echo 1 > functions/hid.usb0/subclass   # boot interface subclass
 echo 2 > functions/hid.usb0/protocol   # mouse
 echo 7 > functions/hid.usb0/report_length
 
-# Report: buttons(5+3pad), X i16, Y i16, wheel i8, AC-pan i8 = 7 bytes
-printf '%b' \
-'\x05\x01\x09\x02\xa1\x01\x09\x01\xa1\x00'\
-'\x05\x09\x19\x01\x29\x05\x15\x00\x25\x01\x95\x05\x75\x01\x81\x02'\
-'\x95\x01\x75\x03\x81\x01'\
-'\x05\x01\x09\x30\x09\x31\x16\x01\x80\x26\xff\x7f\x75\x10\x95\x02\x81\x06'\
-'\x09\x38\x15\x81\x25\x7f\x75\x08\x95\x01\x81\x06'\
-'\x05\x0c\x0a\x38\x02\x15\x81\x25\x7f\x75\x08\x95\x01\x81\x06'\
-'\xc0\xc0' > functions/hid.usb0/report_desc
+# Report: buttons(5+3pad), X i16, Y i16, wheel i8, AC-pan i8 = 7 bytes.
+# Written via python3: printf '%b' truncates at embedded NUL bytes (\x00),
+# which silently corrupted the descriptor to 14 bytes and made Windows
+# reject the HID interface entirely (enumerated but never polled).
+python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(
+    "05010902a1010901a100"
+    "05091901290515002501950575018102"
+    "950175038101"
+    "05010930093116018026ff7f751095028106"
+    "09381581257f750895018106"
+    "050c0a38021581257f750895018106"
+    "c0c0"))' > functions/hid.usb0/report_desc
+DESC_LEN=$(wc -c < functions/hid.usb0/report_desc)
+if [ "$DESC_LEN" -ne 79 ]; then
+    echo "ERROR: report_desc is $DESC_LEN bytes, expected 79" >&2
+    exit 1
+fi
 
 # --- Network function (wired link over the same USB cable) ---
+# MACs pinned: random defaults make Windows see a NEW adapter every rebind,
+# orphaning the DHCP lease (single-IP pool) and breaking relay->Pi routing.
 mkdir -p "functions/$FUNC_NET.usb0"
+echo "02:4d:42:00:00:02" > "functions/$FUNC_NET.usb0/dev_addr"
+echo "02:4d:42:00:00:01" > "functions/$FUNC_NET.usb0/host_addr"
 
 # --- Bind both into one configuration ---
 mkdir -p configs/c.1/strings/0x409

@@ -12,10 +12,27 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
+echo Stopping any running relay...
+taskkill /IM mousebridge-relay.exe /F >nul 2>&1
+
 echo Installing MouseBridge relay...
 if not exist C:\MouseBridge mkdir C:\MouseBridge
 copy /y "%~dp0mousebridge-relay.exe" C:\MouseBridge\ >nul
 copy /y "%~dp0start-relay.cmd" C:\MouseBridge\ >nul
+
+if not exist C:\MouseBridge\config.txt (
+    echo Writing default config.txt...
+    (
+        echo # MouseBridge relay configuration
+        echo LISTEN = 0.0.0.0:8800
+        echo FORWARD = 10.66.0.2:8800
+        echo # Process the kill hotkey terminates; blank = disabled
+        echo KILL_PROCESS =
+        echo KILL_KEY = backslash
+        echo # Green/red bridge indicator overlay
+        echo STATUS_WINDOW = on
+    ) > C:\MouseBridge\config.txt
+)
 
 echo Adding firewall rule (UDP 8800 in)...
 netsh advfirewall firewall delete rule name="MouseBridge Relay" >nul 2>&1
