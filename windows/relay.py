@@ -109,6 +109,59 @@ class PAINTSTRUCT(ctypes.Structure):
                 ("rgbReserved", ctypes.c_byte * 32)]
 
 
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT),
+                ("uFlags", wt.UINT), ("uCallbackMessage", wt.UINT),
+                ("hIcon", wt.HICON), ("szTip", ctypes.c_wchar * 128),
+                ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD),
+                ("szInfo", ctypes.c_wchar * 256), ("uVersion", wt.UINT),
+                ("szInfoTitle", ctypes.c_wchar * 64), ("dwInfoFlags", wt.DWORD),
+                ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wt.HICON)]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
+
+
+WM_TRAY = 0x8000 + 1  # WM_APP + 1
+_tray_nid = None
+
+
+def _tray_add(hwnd):
+    global _tray_nid
+    shell32 = ctypes.windll.shell32
+    nid = NOTIFYICONDATAW()
+    nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+    nid.hWnd = hwnd
+    nid.uID = 1
+    nid.uFlags = 0x1 | 0x2 | 0x4  # MESSAGE | ICON | TIP
+    nid.uCallbackMessage = WM_TRAY
+    nid.hIcon = user32.LoadIconW(None, wt.LPCWSTR(32512))  # IDI_APPLICATION
+    nid.szTip = "MouseBridge Relay (right-click to exit)"
+    shell32.Shell_NotifyIconW(0, ctypes.byref(nid))  # NIM_ADD
+    _tray_nid = nid
+
+
+def _tray_menu(hwnd):
+    """Right-click menu; returns True if Exit was chosen."""
+    menu = user32.CreatePopupMenu()
+    user32.AppendMenuW(menu, 0, 1, "Exit MouseBridge Relay")
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    user32.SetForegroundWindow(hwnd)
+    # TPM_RIGHTBUTTON | TPM_RETURNCMD
+    cmd = user32.TrackPopupMenu(menu, 0x2 | 0x100, pt.x, pt.y, 0, hwnd, None)
+    user32.DestroyMenu(menu)
+    return cmd == 1
+
+
+def _tray_exit():
+    log("Exit chosen from tray icon. Shutting down.")
+    if _tray_nid is not None:
+        ctypes.windll.shell32.Shell_NotifyIconW(2, ctypes.byref(_tray_nid))  # NIM_DELETE
+    os._exit(0)
+
+
 def _rgb(r, g, b):
     return r | (g << 8) | (b << 16)
 
@@ -154,13 +207,19 @@ def _status_wndproc(hwnd, msg, wparam, lparam):
         return 0
     if msg == WM_NCHITTEST:
         return 2  # HTCAPTION: whole window drags
+    if msg == WM_TRAY:
+        if lparam in (0x0205, 0x0202):  # WM_RBUTTONUP / WM_LBUTTONUP
+            if _tray_menu(hwnd):
+                _tray_exit()
+        return 0
     if msg == WM_DESTROY:
         user32.PostQuitMessage(0)
         return 0
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
 
-def status_window_thread():
+def status_window_thread(show_overlay=True):
+    """Owns the tray icon (always) and the status overlay (if enabled)."""
     WS_POPUP = 0x80000000
     WS_EX = 0x8 | 0x08000000 | 0x80 | 0x80000  # TOPMOST|NOACTIVATE|TOOLWINDOW|LAYERED
     SW_SHOWNOACTIVATE = 4
@@ -183,10 +242,14 @@ def status_window_thread():
     if not hwnd:
         log("[Status] window creation failed")
         return
-    user32.SetLayeredWindowAttributes(hwnd, 0, 225, 2)  # LWA_ALPHA
-    user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
-    user32.SetTimer(hwnd, 1, 500, None)
-    log("[Status] indicator window up (drag it anywhere)")
+    _tray_add(hwnd)
+    if show_overlay:
+        user32.SetLayeredWindowAttributes(hwnd, 0, 225, 2)  # LWA_ALPHA
+        user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        user32.SetTimer(hwnd, 1, 500, None)
+        log("[Status] indicator window up (drag it anywhere); tray icon has Exit")
+    else:
+        log("[Status] overlay off; tray icon has Exit")
 
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -304,8 +367,8 @@ def main():
     sock.settimeout(0.25)  # short so stream-release detection is snappy
     log(f"Relaying {listen} -> {forward}")
 
-    if status_win:
-        threading.Thread(target=status_window_thread, daemon=True).start()
+    threading.Thread(target=status_window_thread, args=(status_win,),
+                     daemon=True).start()
     threading.Thread(target=pi_prober, args=(sock, dst), daemon=True).start()
 
     probe_bytes = struct.pack(PACKET_FMT, MAGIC, PROBE_SEQ, 0,
