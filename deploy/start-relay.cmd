@@ -1,5 +1,5 @@
 @echo off
-rem Launches the windowless relay; the green/red status overlay is its UI.
-rem Logs: C:\MouseBridge\mousebridge-relay.log
-cd /d C:\MouseBridge
-start "" C:\MouseBridge\mousebridge-relay.exe
+rem Launches the windowless relay; status overlay + tray icon are its UI.
+rem Config/log: %USERPROFILE%\MouseBridge\
+cd /d "%USERPROFILE%\MouseBridge"
+start "" "%USERPROFILE%\MouseBridge\mousebridge-relay.exe"

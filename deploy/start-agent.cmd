@@ -1,6 +1,6 @@
 @echo off
 title MouseBridge Agent (local)
-cd /d C:\MouseBridge
+cd /d "%USERPROFILE%\MouseBridge"
 :loop
 echo [%date% %time%] Starting MouseBridge agent...
 mousebridge-agent.exe

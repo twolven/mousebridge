@@ -1,8 +1,9 @@
 @echo off
 rem ===========================================================================
 rem MouseBridge relay installer - run this ON BREAKER (double-click)
-rem Installs to C:\MouseBridge, opens UDP 8800 in the firewall, sets the
-rem relay to start at logon in a visible console window, and starts it now.
+rem Installs to %USERPROFILE%\MouseBridge, opens UDP 8800 in the firewall,
+rem adds a logon startup entry, and starts the relay (tray icon + status
+rem overlay; right-click the tray icon to exit).
 rem ===========================================================================
 
 net session >nul 2>&1
@@ -12,15 +13,27 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
+set "DEST=%USERPROFILE%\MouseBridge"
+
 echo Stopping any running relay...
 taskkill /IM mousebridge-relay.exe /F >nul 2>&1
 
-echo Installing MouseBridge relay...
-if not exist C:\MouseBridge mkdir C:\MouseBridge
-copy /y "%~dp0mousebridge-relay.exe" C:\MouseBridge\ >nul
-copy /y "%~dp0start-relay.cmd" C:\MouseBridge\ >nul
+echo Installing MouseBridge relay to %DEST% ...
+if not exist "%DEST%" mkdir "%DEST%"
+copy /y "%~dp0mousebridge-relay.exe" "%DEST%\" >nul
+copy /y "%~dp0start-relay.cmd" "%DEST%\" >nul
 
-if not exist C:\MouseBridge\config.txt (
+rem Migrate from the old C:\MouseBridge location if present
+if exist C:\MouseBridge\config.txt if not exist "%DEST%\config.txt" (
+    echo Migrating existing config.txt from C:\MouseBridge...
+    copy /y C:\MouseBridge\config.txt "%DEST%\" >nul
+)
+if exist C:\MouseBridge (
+    echo Removing old C:\MouseBridge...
+    rmdir /s /q C:\MouseBridge
+)
+
+if not exist "%DEST%\config.txt" (
     echo Writing default config.txt...
     (
         echo # MouseBridge relay configuration
@@ -31,21 +44,21 @@ if not exist C:\MouseBridge\config.txt (
         echo KILL_KEY = backslash
         echo # Green/red bridge indicator overlay
         echo STATUS_WINDOW = on
-    ) > C:\MouseBridge\config.txt
+    ) > "%DEST%\config.txt"
 )
 
-echo Adding firewall rule (UDP 8800 in)...
+echo Updating firewall rule (UDP 8800 in)...
 netsh advfirewall firewall delete rule name="MouseBridge Relay" >nul 2>&1
-netsh advfirewall firewall add rule name="MouseBridge Relay" dir=in action=allow program="C:\MouseBridge\mousebridge-relay.exe" protocol=UDP localport=8800 >nul
+netsh advfirewall firewall add rule name="MouseBridge Relay" dir=in action=allow program="%DEST%\mousebridge-relay.exe" protocol=UDP localport=8800 >nul
 
-echo Adding startup entry (visible console at logon)...
-copy /y C:\MouseBridge\start-relay.cmd "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\MouseBridge Relay.cmd" >nul
+echo Adding startup entry...
+copy /y "%DEST%\start-relay.cmd" "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\MouseBridge Relay.cmd" >nul
 
 echo Starting relay now...
-start "MouseBridge Relay (Breaker)" C:\MouseBridge\start-relay.cmd
+call "%DEST%\start-relay.cmd"
 
 echo.
-echo Done. A "MouseBridge Relay" console window should now be visible.
-echo Logs also append to C:\MouseBridge\mousebridge-relay.log
+echo Done. Look for the status overlay (bottom-right) and the tray icon.
+echo Config: %DEST%\config.txt   Log: %DEST%\mousebridge-relay.log
 echo.
 pause
