@@ -58,7 +58,8 @@ VK_NAMES = {
 
 def log(message):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [Relay] {message}"
-    print(line, flush=True)
+    if sys.stdout:  # None in windowed (no-console) builds
+        print(line, flush=True)
     try:
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
             os.replace(LOG_FILE, LOG_FILE + ".old")
@@ -261,6 +262,11 @@ def main():
         cfg.get("STATUS_WINDOW", cfg.get("POPUPS", "on")).lower() != "off"
 
     log("Starting MouseBridge relay v0.4...")
+    # Single instance only (windowless build - no console to spot doubles)
+    kernel32.CreateMutexW(None, False, "Global\\MouseBridgeRelay")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        log("Another relay instance is already running. Exiting.")
+        sys.exit(0)
     log(f"Config file: {CONFIG_FILE} ({'found' if cfg else 'not found, defaults'})")
     log("Effective configuration:")
     log(f"  LISTEN        : {listen}")
@@ -286,8 +292,15 @@ def main():
     fhost, fport = forward.rsplit(":", 1)
     dst = (fhost, int(fport))
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((lhost, int(lport)))
+    # Retry bind until the port frees up (e.g. an old instance still closing)
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((lhost, int(lport)))
+            break
+        except OSError as e:
+            log(f"Bind failed ({e}); retrying in 3s...")
+            time.sleep(3)
     sock.settimeout(0.25)  # short so stream-release detection is snappy
     log(f"Relaying {listen} -> {forward}")
 
@@ -355,4 +368,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Windowless build: no console restart loop, so survive our own crashes
+    while True:
+        try:
+            main()
+            break  # clean exit (e.g. second-instance mutex)
+        except SystemExit:
+            break
+        except Exception as e:
+            log(f"FATAL: {e!r} - restarting in 3s")
+            time.sleep(3)

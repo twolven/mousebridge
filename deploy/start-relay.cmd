@@ -1,9 +1,5 @@
 @echo off
-title MouseBridge Relay (Breaker)
+rem Launches the windowless relay; the green/red status overlay is its UI.
+rem Logs: C:\MouseBridge\mousebridge-relay.log
 cd /d C:\MouseBridge
-:loop
-echo [%date% %time%] Starting MouseBridge relay (config: C:\MouseBridge\config.txt)...
-mousebridge-relay.exe
-echo [%date% %time%] Relay exited (code %errorlevel%) - restarting in 3s...
-timeout /t 3 /nobreak >nul
-goto loop
+start "" C:\MouseBridge\mousebridge-relay.exe
