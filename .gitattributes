@@ -3,3 +3,4 @@
 *.service text eol=lf
 pi/** text eol=lf
 *.py text eol=lf
+*.cmd text eol=crlf
