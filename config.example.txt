@@ -10,3 +10,9 @@ PI_PORT = 8800
 WINDOW_TITLE = YourPCName - Moonlight
 # 'exact' or 'contains'
 TITLE_MATCH = exact
+
+# Motion multiplier to match your accustomed DPI feel on the remote side:
+# >1 = faster remote cursor, <1 = slower. Fractional remainders carry over,
+# so slow precise movements are never lost. (e.g. old DPI 1600 but sensor
+# now runs 800 -> SCALE = 2.0)
+SCALE = 1.0

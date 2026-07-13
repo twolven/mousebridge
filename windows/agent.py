@@ -25,6 +25,7 @@ PI_HOST = "127.0.0.1"
 PI_PORT = 8800
 WINDOW_TITLE = "Moonlight"
 TITLE_MATCH = "exact"  # exact | contains
+SCALE = 1.0  # motion multiplier: >1 = faster remote cursor, <1 = slower
 
 
 BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
@@ -45,7 +46,7 @@ def log(message):
 
 
 def load_config(filename="config.txt"):
-    global PI_HOST, PI_PORT, WINDOW_TITLE, TITLE_MATCH
+    global PI_HOST, PI_PORT, WINDOW_TITLE, TITLE_MATCH, SCALE
     path = os.path.join(BASE_DIR, filename)
     if not os.path.exists(path):
         log(f"No config at '{path}', using defaults.")
@@ -66,11 +67,14 @@ def load_config(filename="config.txt"):
                     WINDOW_TITLE = value
                 elif key == "TITLE_MATCH":
                     TITLE_MATCH = value.lower()
+                elif key == "SCALE":
+                    SCALE = float(value)
                 else:
                     log(f"Warning: unknown key '{key}' on line {line_num}")
             except ValueError:
                 log(f"Warning: bad value for '{key}' on line {line_num}: '{value}'")
-    log(f"Config: target={PI_HOST}:{PI_PORT} title='{WINDOW_TITLE}' ({TITLE_MATCH})")
+    log(f"Config: target={PI_HOST}:{PI_PORT} title='{WINDOW_TITLE}' "
+        f"({TITLE_MATCH}) scale={SCALE}")
 
 
 # --- Win32 setup ---
@@ -182,6 +186,19 @@ class Bridge:
         self.send_errors = 0
         self.session_start = 0.0
         self.next_stats = 0.0
+        # Fractional motion carry so SCALE never loses slow precise movement
+        self.acc_x = 0.0
+        self.acc_y = 0.0
+
+    def scale_motion(self, dx, dy):
+        if SCALE == 1.0:
+            return dx, dy
+        self.acc_x += dx * SCALE
+        self.acc_y += dy * SCALE
+        out_x, out_y = int(self.acc_x), int(self.acc_y)
+        self.acc_x -= out_x
+        self.acc_y -= out_y
+        return out_x, out_y
 
     def send(self, dx=0, dy=0, wheel=0, hwheel=0, flags=0):
         pkt = struct.pack(PACKET_FMT, MAGIC, self.seq, self.buttons, flags,
@@ -269,8 +286,9 @@ def handle_raw_input(lparam):
 
     dx = dy = 0
     if not (m.usFlags & MOUSE_MOVE_ABSOLUTE):
-        dx = clamp(m.lLastX, -32767, 32767)
-        dy = clamp(m.lLastY, -32767, 32767)
+        dx, dy = bridge.scale_motion(m.lLastX, m.lLastY)
+        dx = clamp(dx, -32767, 32767)
+        dy = clamp(dy, -32767, 32767)
 
     if bridge.streaming and (dx or dy or wheel or hwheel or bf):
         bridge.send(dx, dy, wheel, hwheel)
