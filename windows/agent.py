@@ -241,6 +241,10 @@ class Bridge:
         self.click_grace_until = 0.0
         self.suppressed = 0
         self.press_t = {}  # button bit -> press time (hold-duration logging)
+        # Wheel carry: free-spin/high-res wheels send deltas <120; floor
+        # division dropped up-scrolls and over-fired down-scrolls
+        self.acc_wheel = 0
+        self.acc_hwheel = 0
 
     def scale_motion(self, dx, dy):
         if SCALE == 1.0:
@@ -360,9 +364,13 @@ def handle_raw_input(lparam):
 
     wheel = hwheel = 0
     if bf & RI_MOUSE_WHEEL:
-        wheel = clamp(ctypes.c_short(m.usButtonData).value // WHEEL_DELTA, -127, 127)
+        bridge.acc_wheel += ctypes.c_short(m.usButtonData).value
+        wheel = clamp(int(bridge.acc_wheel / WHEEL_DELTA), -127, 127)
+        bridge.acc_wheel -= wheel * WHEEL_DELTA
     if bf & RI_MOUSE_HWHEEL:
-        hwheel = clamp(ctypes.c_short(m.usButtonData).value // WHEEL_DELTA, -127, 127)
+        bridge.acc_hwheel += ctypes.c_short(m.usButtonData).value
+        hwheel = clamp(int(bridge.acc_hwheel / WHEEL_DELTA), -127, 127)
+        bridge.acc_hwheel -= hwheel * WHEEL_DELTA
 
     dx = dy = 0
     if not (m.usFlags & MOUSE_MOVE_ABSOLUTE):
