@@ -234,9 +234,13 @@ class Bridge:
         # Fractional motion carry so SCALE never loses slow precise movement
         self.acc_x = 0.0
         self.acc_y = 0.0
-        # Buttons masked until this deadline after focus gain, so the click
-        # that focused the streaming window never fires remotely
+        # Click grace: only the press that focused the streaming window is
+        # suppressed - and it stays suppressed until its physical release.
+        # Masking by time instead (v1.0.1) broke drag-and-drop: the held
+        # button flipped 0->1 remotely when the deadline passed mid-drag.
         self.click_grace_until = 0.0
+        self.suppressed = 0
+        self.press_t = {}  # button bit -> press time (hold-duration logging)
 
     def scale_motion(self, dx, dy):
         if SCALE == 1.0:
@@ -249,9 +253,7 @@ class Bridge:
         return out_x, out_y
 
     def send(self, dx=0, dy=0, wheel=0, hwheel=0, flags=0):
-        buttons = self.buttons
-        if buttons and time.monotonic() < self.click_grace_until:
-            buttons = 0  # focus-gaining click: motion passes, buttons don't
+        buttons = self.buttons & ~self.suppressed
         pkt = struct.pack(PACKET_FMT, MAGIC, self.seq, buttons, flags,
                           dx, dy, wheel, hwheel)
         self.seq = (self.seq + 1) & 0xFFFF
@@ -280,10 +282,17 @@ class Bridge:
             self.session_start = time.monotonic()
             self.next_stats = self.session_start + self.STATS_INTERVAL
             self.click_grace_until = self.session_start + CLICK_GRACE_MS / 1000.0
+            # A button already down at focus gain IS the focusing click
+            # (WM_INPUT often lands before the foreground event)
+            self.suppressed = self.buttons
             log(f"Focus GAINED -> streaming to {self.target[0]}:{self.target[1]}")
         else:
+            if self.buttons & ~self.suppressed:
+                log(f"[Buttons] focus lost with 0x{self.buttons:02X} held "
+                    f"-> released remotely")
             # Release everything on the remote side before going silent
             self.buttons = 0
+            self.suppressed = 0
             self.send(flags=FLAG_KEEPALIVE)
             mins = (time.monotonic() - self.session_start) / 60.0
             log(f"Focus LOST -> stream stopped ({self.sent} packets, "
@@ -299,15 +308,22 @@ def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-def title_matches(hwnd):
+def window_title(hwnd):
     length = user32.GetWindowTextLengthW(hwnd)
     if length <= 0:
-        return False
+        return ""
     buf = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def title_matches(hwnd):
+    title = window_title(hwnd)
+    if not title:
+        return False
     if TITLE_MATCH == "contains":
-        return WINDOW_TITLE in buf.value
-    return buf.value == WINDOW_TITLE
+        return WINDOW_TITLE in title
+    return title == WINDOW_TITLE
 
 
 def handle_raw_input(lparam):
@@ -325,11 +341,22 @@ def handle_raw_input(lparam):
     m = raw.mouse
     bf = m.usButtonFlags
 
+    now = time.monotonic()
     for down, up, bit in BUTTON_MAP:
         if bf & down:
             bridge.buttons |= bit
+            bridge.press_t[bit] = now
+            if bridge.streaming and now < bridge.click_grace_until:
+                bridge.suppressed |= bit
+                log(f"[Buttons] press 0x{bit:02X} suppressed (focus click grace)")
         if bf & up:
             bridge.buttons &= ~bit
+            held_ms = (now - bridge.press_t.pop(bit, now)) * 1000.0
+            if bridge.suppressed & bit:
+                bridge.suppressed &= ~bit
+                log(f"[Buttons] suppressed 0x{bit:02X} released ({held_ms:.0f}ms)")
+            elif bridge.streaming and held_ms >= 300:
+                log(f"[Buttons] 0x{bit:02X} released after {held_ms:.0f}ms hold")
 
     wheel = hwheel = 0
     if bf & RI_MOUSE_WHEEL:
@@ -366,11 +393,14 @@ def wnd_proc(hwnd, msg, wparam, lparam):
 @WINEVENTPROC
 def win_event_proc(hook, event, hwnd, id_object, id_child, thread, ms_time):
     if event == EVENT_SYSTEM_FOREGROUND and hwnd:
-        bridge.set_streaming(title_matches(hwnd))
+        matches = title_matches(hwnd)
+        if not matches and bridge.streaming and bridge.buttons & ~bridge.suppressed:
+            log(f"[Focus] stolen by '{window_title(hwnd)}' mid-hold")
+        bridge.set_streaming(matches)
 
 
 def main():
-    log("Starting MouseBridge agent v1.0...")
+    log("Starting MouseBridge agent v1.0.2...")
     # Single instance only - a second agent would double-send every packet
     kernel32.CreateMutexW(None, False, "Global\\MouseBridgeAgent")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS

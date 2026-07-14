@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 ###############################################################################
-# MouseBridge hidpump v0.1 - Pi (gadget side)
+# MouseBridge hidpump v0.3 - Pi (gadget side)
 #
 # Receives 12-byte UDP packets and writes 7-byte HID mouse reports to
 # /dev/hidg0. Failsafe: if the stream goes silent while buttons are held
 # (agent crash, link drop), releases all buttons after FAILSAFE_S.
+#
+# v0.3: relay health probes (seq 0xFFFE, buttons=0) are echo-only - they
+# were being written as input, releasing any held button every 2s (broke
+# every drag-and-drop) and poisoning the seq-gap loss stats.
 ###############################################################################
 
 import errno
@@ -23,10 +27,13 @@ REPORT_FMT = "<Bhhbb"  # buttons, dx, dy, wheel, hwheel
 FLAG_KEEPALIVE = 0x01
 
 FLAG_ECHO = 0x02  # reply to sender after processing (latency measurement)
+PROBE_SEQ = 0xFFFE  # relay health probes: echo-only, never input
 
 LISTEN_PORT = 8800
 HID_DEV = "/dev/hidg0"
-FAILSAFE_S = 0.3
+# Crash safety only (the agent releases explicitly on focus loss); 0.3s was
+# tight - real streams showed 456ms keepalive gaps, which would drop a drag
+FAILSAFE_S = 1.0
 
 running = True
 
@@ -61,6 +68,7 @@ def main():
     last_seq = None
     lost = 0
     received = 0
+    press_t = {}  # button bit -> press time (hold-duration logging)
 
     # Rolling 60s stability stats: rx rate, seq-gap loss, worst inter-packet
     # gap while a stream is active (gaps >500ms = focus pause, not jitter)
@@ -108,6 +116,17 @@ def main():
         if magic != MAGIC:
             continue
 
+        if seq == PROBE_SEQ:
+            # Relay health probe: answer it and touch NOTHING else. Its
+            # buttons=0 must not reach the HID (it released held buttons
+            # mid-drag) and its seq must not count as packet loss.
+            if flags & FLAG_ECHO:
+                try:
+                    sock.sendto(data, sender)
+                except OSError:
+                    pass
+            continue
+
         received += 1
         win_rx += 1
         # Seq gaps only count within a live stream; after >1s of silence the
@@ -129,9 +148,10 @@ def main():
                            and not (dx or dy or wheel or hwheel))
         if needs_write:
             report = struct.pack(REPORT_FMT, buttons, dx, dy, wheel, hwheel)
+            wrote = False
             try:
                 os.write(hid, report)
-                last_buttons = buttons
+                wrote = True
             except OSError as e:
                 if e.errno == errno.EAGAIN:
                     # Endpoint busy: the 1-slot queue still holds the previous
@@ -143,7 +163,7 @@ def main():
                     try:
                         if writable:
                             os.write(hid, report)
-                            last_buttons = buttons
+                            wrote = True
                         else:
                             win_dropped += 1  # host genuinely not polling
                     except OSError:
@@ -151,6 +171,17 @@ def main():
                 else:
                     log(f"HID write error: {e}")
                     time.sleep(0.5)
+            if wrote:
+                if buttons != last_buttons:
+                    for bit in (0x01, 0x02, 0x04, 0x08, 0x10):
+                        if buttons & bit and not last_buttons & bit:
+                            press_t[bit] = now
+                        elif last_buttons & bit and not buttons & bit:
+                            held = (now - press_t.pop(bit, now)) * 1000.0
+                            if held >= 300:
+                                log(f"[Buttons] 0x{bit:02X} released after "
+                                    f"{held:.0f}ms hold (seq {seq})")
+                last_buttons = buttons
 
         # Echo after processing so a round-trip measures the full program path
         if flags & FLAG_ECHO:
