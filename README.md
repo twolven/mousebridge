@@ -50,9 +50,10 @@ into the host's USB stack; 5,000 probes):
 ```
 
 - **Agent** (local PC, `windows/agent.py`): Raw Input mouse capture,
-  event-driven focus detection (`SetWinEventHook`, zero polling). Streams
-  12-byte UDP packets only while the configured window title is foreground;
-  sends a release packet and goes silent on focus loss. Single-instance.
+  event-driven focus detection (`SetWinEventHook`) with a 200 ms foreground
+  reconciliation pass that self-heals missed events. Streams 12-byte UDP
+  packets only while the configured window title is foreground; sends a
+  release packet and goes silent on focus loss. Single-instance.
 - **Relay** (remote PC, `windows/relay.py`): windowless tray app. Forwards
   agent packets from the LAN to the Pi over the USB-ethernet link, shows a
   draggable always-on-top indicator — **green "ACTIVE"** when the stream is
@@ -189,6 +190,11 @@ with the bridge's hardware clicks and break double-clicks.
   the Pi; re-plugging the cable re-enumerates everything.
 - **Red "idle" while Moonlight is focused**: agent side — check the agent
   console/log and that `WINDOW_TITLE` exactly matches (it's case-sensitive).
+  Before v1.0.3 this also happened on its own: Explorer's invisible alt-tab
+  switcher windows take the foreground for a frame, the gate read that as
+  "focus left" and latched off, and no event ever came back because focus
+  never really moved. Fixed — invisible/titleless windows can't move the
+  gate, and the reconciliation pass re-syncs it within 200 ms.
 - **Enumerated but no input** (`hidwrite_probe` says NOT polling): don't set
   the gadget's VID/PID to a vendor whose software runs on the host —
   e.g. Logitech IDs with G HUB installed: the vendor driver claims the

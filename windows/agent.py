@@ -4,7 +4,8 @@
 # Captures the physical mouse via Raw Input and streams HID deltas over UDP
 # to the Pi gadget (usually via the relay on the remote PC) - but only while
 # the configured streaming window is in the foreground. Focus changes are
-# event-driven (SetWinEventHook), not polled.
+# event-driven (SetWinEventHook), with a light foreground poll that reconciles
+# the gate when an event is missed or a helper window fakes a focus loss.
 ###############################################################################
 
 import ctypes
@@ -19,6 +20,8 @@ MAGIC = 0x4D42  # "MB"
 PACKET_FMT = "<HHBbhhbb"  # magic, seq, buttons, flags, dx, dy, wheel, hwheel
 FLAG_KEEPALIVE = 0x01
 KEEPALIVE_MS = 100
+RECONCILE_MS = 200  # how often the timer re-checks the gate against the real
+                    # foreground window (self-heals missed/spurious events)
 
 # --- Config (defaults, overridden by config.txt) ---
 PI_HOST = "127.0.0.1"
@@ -135,6 +138,10 @@ user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
                                    wt.HINSTANCE, wt.LPVOID]
 user32.GetForegroundWindow.restype = wt.HWND
 user32.SetWinEventHook.restype = wt.HANDLE
+user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.IsWindowVisible.argtypes = [wt.HWND]
 user32.DefWindowProcW.restype = ctypes.c_longlong
 user32.DefWindowProcW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
@@ -207,6 +214,8 @@ WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wt.HWND, ctypes.c_uint,
                              wt.WPARAM, wt.LPARAM)
 WINEVENTPROC = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND,
                                   wt.LONG, wt.LONG, wt.DWORD, wt.DWORD)
+WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wt.LPARAM]
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -241,6 +250,11 @@ class Bridge:
         self.click_grace_until = 0.0
         self.suppressed = 0
         self.press_t = {}  # button bit -> press time (hold-duration logging)
+        # The window that currently owns the gate. Only the foreground window
+        # drives it - a second Moonlight instance's windows never do.
+        self.stream_hwnd = 0
+        self.stream_pid = 0
+        self.next_reconcile = 0.0
         # Wheel carry: free-spin/high-res wheels send deltas <120; floor
         # division dropped up-scrolls and over-fired down-scrolls
         self.acc_wheel = 0
@@ -278,7 +292,44 @@ class Bridge:
                 f"{self.send_errors} send errors")
             self.next_stats = now + self.STATS_INTERVAL
 
-    def set_streaming(self, on):
+    def reconcile_focus(self):
+        """Re-check the gate against the real foreground window.
+
+        Pure event gating gets stuck: a helper window flashes to the
+        foreground for one frame, the gate latches OFF, and no further
+        foreground event ever arrives because focus never actually left the
+        stream window - the "Moonlight is focused but the bridge is dead until
+        I alt-tab out and back" bug.  Polling a few times a second self-heals
+        it whatever the cause (missed event, coalesced event, duplicate
+        Moonlight instance).
+        """
+        now = time.monotonic()
+        if now < self.next_reconcile:
+            return
+        self.next_reconcile = now + RECONCILE_MS / 1000.0
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or gate_ignorable(hwnd):
+            return
+        should = title_matches(hwnd)
+        if should == self.streaming:
+            return
+        log(f"[Focus] gate out of sync - foreground is '{window_title(hwnd)}' "
+            f"(hwnd 0x{hwnd:X}, pid {window_pid(hwnd)}); "
+            f"streaming {self.streaming} -> {should}")
+        self.set_streaming(should, hwnd)
+
+    def warn_on_duplicates(self):
+        """Two Moonlight instances = two sets of windows fighting over the
+        gate. Harmless now that only the foreground one drives it, but say so.
+        """
+        others = [w for w in matching_windows() if w[0] != self.stream_hwnd]
+        if others:
+            pids = ", ".join(str(pid) for _, pid in others)
+            log(f"[WARN] {len(others)} other window(s) titled "
+                f"'{WINDOW_TITLE}' (pid {pids}) - duplicate Moonlight "
+                f"instances; only the foreground one drives the gate")
+
+    def set_streaming(self, on, hwnd=0):
         if on == self.streaming:
             return
         self.streaming = on
@@ -289,7 +340,11 @@ class Bridge:
             # A button already down at focus gain IS the focusing click
             # (WM_INPUT often lands before the foreground event)
             self.suppressed = self.buttons
-            log(f"Focus GAINED -> streaming to {self.target[0]}:{self.target[1]}")
+            self.stream_hwnd = hwnd or user32.GetForegroundWindow() or 0
+            self.stream_pid = window_pid(self.stream_hwnd)
+            log(f"Focus GAINED -> streaming to {self.target[0]}:{self.target[1]} "
+                f"(hwnd 0x{self.stream_hwnd:X}, pid {self.stream_pid})")
+            self.warn_on_duplicates()
         else:
             if self.buttons & ~self.suppressed:
                 log(f"[Buttons] focus lost with 0x{self.buttons:02X} held "
@@ -321,6 +376,12 @@ def window_title(hwnd):
     return buf.value
 
 
+def window_pid(hwnd):
+    pid = wt.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
 def title_matches(hwnd):
     title = window_title(hwnd)
     if not title:
@@ -328,6 +389,35 @@ def title_matches(hwnd):
     if TITLE_MATCH == "contains":
         return WINDOW_TITLE in title
     return title == WINDOW_TITLE
+
+
+def gate_ignorable(hwnd):
+    """Reason this foreground window must not move the gate, else None.
+
+    Hidden helper windows (IME, Qt observers, a second Moonlight's launcher)
+    take the foreground for a frame and hand it straight back.  Treating those
+    as "focus left Moonlight" is what killed the stream mid-game, and because
+    focus never really moved, no event came to turn it back on.
+    """
+    if not user32.IsWindowVisible(hwnd):
+        return "invisible"
+    if not window_title(hwnd) and window_pid(hwnd) == bridge.stream_pid:
+        return "titleless sibling of the stream window"
+    return None
+
+
+def matching_windows():
+    """Every visible top-level window whose title matches the gate."""
+    found = []
+
+    @WNDENUMPROC
+    def collect(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd) and title_matches(hwnd):
+            found.append((hwnd, window_pid(hwnd)))
+        return True
+
+    user32.EnumWindows(collect, 0)
+    return found
 
 
 def handle_raw_input(lparam):
@@ -391,6 +481,7 @@ def wnd_proc(hwnd, msg, wparam, lparam):
         if bridge.streaming:
             bridge.send(flags=FLAG_KEEPALIVE)  # keeps held buttons alive on the pump
             bridge.maybe_log_stats()
+        bridge.reconcile_focus()
         return 0
     if msg == WM_DESTROY:
         user32.PostQuitMessage(0)
@@ -400,15 +491,24 @@ def wnd_proc(hwnd, msg, wparam, lparam):
 
 @WINEVENTPROC
 def win_event_proc(hook, event, hwnd, id_object, id_child, thread, ms_time):
-    if event == EVENT_SYSTEM_FOREGROUND and hwnd:
-        matches = title_matches(hwnd)
-        if not matches and bridge.streaming and bridge.buttons & ~bridge.suppressed:
-            log(f"[Focus] stolen by '{window_title(hwnd)}' mid-hold")
-        bridge.set_streaming(matches)
+    if event != EVENT_SYSTEM_FOREGROUND or not hwnd:
+        return
+    reason = gate_ignorable(hwnd)
+    if reason:
+        if bridge.streaming:
+            log(f"[Focus] ignored {reason} foreground window "
+                f"(hwnd 0x{hwnd:X}, pid {window_pid(hwnd)})")
+        return
+    matches = title_matches(hwnd)
+    if not matches and bridge.streaming:
+        held = " mid-hold" if bridge.buttons & ~bridge.suppressed else ""
+        log(f"[Focus] taken by '{window_title(hwnd)}' "
+            f"(pid {window_pid(hwnd)}){held}")
+    bridge.set_streaming(matches, hwnd)
 
 
 def main():
-    log("Starting MouseBridge agent v1.0.2...")
+    log("Starting MouseBridge agent v1.0.3...")
     # Single instance only - a second agent would double-send every packet
     kernel32.CreateMutexW(None, False, "Global\\MouseBridgeAgent")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
@@ -448,8 +548,9 @@ def main():
 
     # Prime state from whatever is focused right now
     fg = user32.GetForegroundWindow()
-    bridge.set_streaming(bool(fg) and title_matches(fg))
-    log("Ready. Event-driven; idle until the streaming window takes focus.")
+    bridge.set_streaming(bool(fg) and title_matches(fg), fg or 0)
+    log(f"Ready. Event-driven + {RECONCILE_MS}ms foreground reconciliation; "
+        f"idle until the streaming window takes focus.")
 
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
