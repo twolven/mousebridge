@@ -212,6 +212,10 @@ wheel/hwheel i8. HID report (7 bytes): buttons u8, dx i16, dy i16, wheel i8,
 hwheel i8. LAN-only by design; there is no authentication — don't expose
 port 8800 beyond your LAN.
 
+## Author
+
+[Todd Wolven](https://toddwolven.com/) - Lead AI Software Developer and open-source GenAI engineer
+
 ## License
 
 MIT
